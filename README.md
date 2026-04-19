@@ -5,7 +5,7 @@ A simple C++ chat server and client example using POSIX sockets.
 This project contains two programs:
 
 - `server`: listens for incoming TCP connections and responds to a single client message.
-- `client`: connects to the server, sends a message, and receives a response.
+- `client`: connects to the server, sends a message, receives a response, then closes the connection.
 
 ## Project Structure
 
