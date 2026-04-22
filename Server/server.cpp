@@ -11,9 +11,16 @@
 #include <sys/types.h>
 #include <thread>
 #include <unistd.h>
+#include <algorithm>
 
 Server::Server(int port)
-  : port_(port), running_(false), listen_fd_(-1) {
+  : port_(port), 
+    running_(false), 
+    listen_fd_(-1), 
+    mongo_instance_{},
+    mongo_client_{mongocxx::uri{"mongodb://localhost:27017"}},
+    db_{mongo_client_["chat-server"]},
+    messages_col_{db_["messages"]} {
   init();
 }
 
@@ -109,7 +116,7 @@ void Server::acceptLoop() {
       if (errno == EINTR) {
         continue;
       }
-      std::cerr << "Ready error" << std::endl;
+      std::cerr << "Select error" << std::endl;
       break;
     }
 
@@ -126,7 +133,15 @@ void Server::acceptLoop() {
         std::cerr << "Accept error" << std::endl;
         continue;
       }
-      handleClient(clientSocket);
+
+      {
+        std::lock_guard<std::mutex> lock(clients_mutex_);
+        clients_.push_back(clientSocket);
+      }
+
+      std::thread([this, clientSocket]() {
+        handleClient(clientSocket);
+      }).detach();
     }
   }
 }
@@ -134,21 +149,78 @@ void Server::acceptLoop() {
 void Server::handleClient(int clientSocket) {
   std::cout << "Client connected." << std::endl;
 
+  const char* prompt = "Enter your username: ";
+  send(clientSocket, prompt, strlen(prompt), 0);
+
   char buffer[256];
+  std::string username;
+
   ssize_t bytesRead = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
   if (bytesRead > 0) {
     buffer[bytesRead] = '\0';
-    std::cout << "Received from client: " << buffer;
+    username = std::string(buffer);
+
+    if (!username.empty() && username.back() == '\n') username.pop_back();
+    if (!username.empty() && username.back() == '\r') username.pop_back();
   }
 
-  const char* response = "Message received\n";
-  ssize_t bytesSent = send(clientSocket, response, std::strlen(response), 0);
-  if (bytesSent < 0) {
-    std::cerr << "sending message error" << std::endl;
+  std::string joinMsg = username + " has joined the chat\n";
+  std::cout << joinMsg;
+  broadcastMessage(joinMsg, clientSocket);
+
+  while (running_) {
+    ssize_t n = recv(clientSocket, buffer, sizeof(buffer) - 1, 0);
+    if (n <= 0) {
+      break;
+    }
+
+    buffer[n] = '\0';
+    std::string raw(buffer);
+    if (!raw.empty() && raw.back() == '\n') raw.pop_back();
+    if (!raw.empty() && raw.back() == '\r') raw.pop_back();
+
+    std::string message = "[" + username + "]: " + raw + "\n";
+    std::cout << message;
+    broadcastMessage(message, clientSocket);
+    persistMessage(username, raw);
   }
 
+  std::string leaveMsg = username + " has left the chat\n";
+  std::cout << leaveMsg;
+  broadcastMessage(leaveMsg, clientSocket);
+
+  {
+    std::lock_guard<std::mutex> lock(clients_mutex_);
+    clients_.erase(std::remove(clients_.begin(), clients_.end(), clientSocket), clients_.end());
+  }
   close(clientSocket);
-  std::cout << "Client disconnected." << std::endl;
+}
+
+void Server::broadcastMessage(const std::string& message, int senderFd) {
+  std::lock_guard<std::mutex> lock(clients_mutex_);
+  for (int fd: clients_) {
+    if (fd != senderFd) {
+      send(fd, message.c_str(), message.size(), 0);
+    }
+  }
+}
+
+void Server::persistMessage(const std::string& username, const std::string& message) {
+  try {
+    auto now = std::chrono::system_clock::now();
+    auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now.time_since_epoch()).count();
+
+    auto doc = bsoncxx::builder::stream::document{}
+      << "username"  << username
+      << "message"   << message
+      << "timestamp" << bsoncxx::types::b_date{std::chrono::milliseconds{timestamp}}
+      << bsoncxx::builder::stream::finalize;
+
+    messages_col_.insert_one(doc.view());
+  } catch (const std::exception& e) {
+    std::cerr << "MongoDB insert failed: " << e.what() << std::endl;
+  }
 }
 
 void Server::stop() {

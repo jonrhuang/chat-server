@@ -17,14 +17,9 @@ Client::~Client() {
 }
 
 void Client::connectToServer() {
-  if (connected_) {
-    return;
-  }
-
   socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
   if (socket_fd_ < 0) {
-    std::error_code ec(errno, std::generic_category());
-    std::cerr << "Socket creating failed: " << ec.message() << std::endl;
+    std::cerr << "Socket creating failed: " << std::endl;
     return;
   }
 
@@ -40,8 +35,7 @@ void Client::connectToServer() {
   }
 
   if (connect(socket_fd_, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) < 0) {
-    std::error_code ec(errno, std::generic_category());
-    std::cerr << "Could not connect to server: " << ec.message() << std::endl;
+    std::cerr << "Could not connect to server: " << std::endl;
     close(socket_fd_);
     socket_fd_ = -1;
     return;
@@ -72,31 +66,48 @@ void Client::sendMessage(const std::string& message) {
   }
 }
 
-std::string Client::receiveMessage() {
-  if (socket_fd_ < 0) {
-    return {};
-  }
-
+void Client::receiveLoop() {
   char buffer[256];
-  ssize_t received = recv(socket_fd_, buffer, sizeof(buffer) - 1, 0);
-  if (received <= 0) {
-    return {};
-  }
+  while (connected_) {
+    ssize_t n = recv(socket_fd_, buffer, sizeof(buffer) - 1, 0);
+    if (n <= 0) {
+      std::cout << "\nServer disconntected" << std::endl;
+      connected_ = false;
+      break;
+    }
 
-  buffer[received] = '\0';
-  return std::string(buffer);
+    buffer[n] = '\0';
+    std::cout << "\r" << buffer;
+    std::cout.flush();
+  }
 }
 
-void Client::run(std::string message) {
+void Client::run() {
   connectToServer();
   if (!connected_) {
     return;
   }
 
-  sendMessage(message + "\n");
-  std::string response = receiveMessage();
-  if (!response.empty()) {
-    std::cout << "Server response: " << response;
+  char buffer[256];
+  ssize_t n = recv(socket_fd_, buffer, sizeof(buffer) - 1, 0);
+  if (n > 0) {
+    buffer[n] = '\0';
+    std::cout << buffer;
+  }
+
+  std::getline(std::cin, username);
+  sendMessage(username + "\n");
+
+  recv_thread_ = std::thread(&Client::receiveLoop, this);
+
+  std::cout << "Welcome to the server, " + username + ". Ctrl+C to disconnect" << std::endl;
+  std::cout << "[" + username + "]: ";
+
+  std::string line;
+  while (connected_ && std::getline(std::cin, line)) {
+    std::cout << "[" + username + "]: ";
+    if (line.empty()) continue;
+    sendMessage(line + "\n");
   }
 
   stop();
@@ -104,6 +115,9 @@ void Client::run(std::string message) {
 
 void Client::stop() {
   disconnectFromServer();
+  if (recv_thread_.joinable()) {
+    recv_thread_.join();
+  }
 }
 
 bool Client::isConnected() const {
